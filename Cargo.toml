@@ -2,9 +2,17 @@
 name = "ttop"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/yoshito-maeoka/ttop"
+description = "tree view per App process monitor"
+homepage = "https://github.com/yoshito-maeoka/ttop"
 
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
 sysinfo = "0.32"
 anyhow = "1.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
