@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(cargo init:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(timeout 2 cargo run:*)",
+      "Bash(cargo run:*)"
     ]
   }
 }
