@@ -18,6 +18,149 @@ use ratatui::{
 };
 use sysinfo::{Pid, Process, System};
 
+// macOS-specific: Get the responsible PID for a process
+// This is what Activity Monitor uses to group processes by app
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::c_void;
+    use std::mem;
+    use std::sync::OnceLock;
+
+    type ResponsibilityFn = unsafe extern "C" fn(i32) -> i32;
+    type ProcPidInfoFn = unsafe extern "C" fn(i32, i32, u64, *mut c_void, i32) -> i32;
+
+    // proc_info flavors
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+
+    #[repr(C)]
+    struct ProcBsdShortInfo {
+        pbsi_pid: u32,
+        pbsi_ppid: u32,
+        pbsi_pgid: u32,
+        pbsi_status: u32,
+        pbsi_comm: [u8; 16],
+        pbsi_flags: u32,
+        pbsi_uid: u32,
+        pbsi_gid: u32,
+        pbsi_ruid: u32,
+        pbsi_rgid: u32,
+        pbsi_svuid: u32,
+        pbsi_svgid: u32,
+        pbsi_rfu: u32,
+    }
+
+    static RESPONSIBILITY_FN: OnceLock<Option<ResponsibilityFn>> = OnceLock::new();
+    static PROC_PIDINFO_FN: OnceLock<Option<ProcPidInfoFn>> = OnceLock::new();
+
+    fn get_responsibility_fn() -> Option<ResponsibilityFn> {
+        *RESPONSIBILITY_FN.get_or_init(|| unsafe {
+            let handle = libc::dlopen(std::ptr::null(), libc::RTLD_LAZY);
+            if handle.is_null() {
+                return None;
+            }
+            let symbol_name = b"responsibility_get_pid_responsible_for_pid\0";
+            let symbol = libc::dlsym(handle, symbol_name.as_ptr() as *const i8);
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, ResponsibilityFn>(symbol))
+            }
+        })
+    }
+
+    fn get_proc_pidinfo_fn() -> Option<ProcPidInfoFn> {
+        *PROC_PIDINFO_FN.get_or_init(|| unsafe {
+            let handle = libc::dlopen(std::ptr::null(), libc::RTLD_LAZY);
+            if handle.is_null() {
+                return None;
+            }
+            let symbol_name = b"proc_pidinfo\0";
+            let symbol = libc::dlsym(handle, symbol_name.as_ptr() as *const i8);
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, ProcPidInfoFn>(symbol))
+            }
+        })
+    }
+
+    /// Get process group ID - processes in the same app often share this
+    pub fn get_process_group(pid: u32) -> Option<u32> {
+        let func = get_proc_pidinfo_fn()?;
+        unsafe {
+            let mut info: ProcBsdShortInfo = mem::zeroed();
+            let size = mem::size_of::<ProcBsdShortInfo>() as i32;
+
+            let ret = func(
+                pid as i32,
+                PROC_PIDT_SHORTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut c_void,
+                size,
+            );
+
+            if ret > 0 {
+                Some(info.pbsi_pgid)
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn get_responsible_pid(pid: u32) -> Option<u32> {
+        // Try using responsibility_get_pid_responsible_for_pid if available
+        if let Some(func) = get_responsibility_fn() {
+            let responsible = unsafe { func(pid as i32) };
+            if responsible > 0 && responsible != pid as i32 {
+                return Some(responsible as u32);
+            }
+        }
+        None
+    }
+
+    /// Check if a process name matches known helper patterns for an app
+    /// Returns the app name if this is a known helper process
+    pub fn get_parent_app_name(process_name: &str) -> Option<&'static str> {
+        let name_lower = process_name.to_lowercase();
+
+        // Safari's WebKit processes
+        if name_lower.contains("webkit") && name_lower.starts_with("com.apple.webkit") {
+            return Some("Safari");
+        }
+
+        // Google Chrome helpers
+        if name_lower.contains("google chrome helper") {
+            return Some("Google Chrome");
+        }
+
+        // Firefox helpers
+        if name_lower.contains("firefox") && name_lower.contains("helper") {
+            return Some("Firefox");
+        }
+
+        // Slack helpers
+        if name_lower.contains("slack") && name_lower.contains("helper") {
+            return Some("Slack");
+        }
+
+        // VS Code helpers
+        if name_lower.contains("code helper") || name_lower.contains("electron helper") {
+            if name_lower.contains("code") {
+                return Some("Code");
+            }
+        }
+
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod macos {
+    pub fn get_responsible_pid(_pid: u32) -> Option<u32> {
+        None // Not supported on non-macOS
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortMode {
     Cpu,
@@ -100,21 +243,112 @@ impl App {
     fn build_groups(&mut self) {
         let processes = self.system.processes();
 
-        // Find root processes (processes whose parent doesn't exist or is pid 0/1)
-        let mut root_pids: Vec<Pid> = Vec::new();
+        // Map each PID to its responsible PID (the app that owns it)
+        // On macOS, use the responsible process API
+        // On other systems, fall back to parent PID
+        let mut responsible_map: HashMap<Pid, Pid> = HashMap::new();
+
+        // First pass: get responsible PIDs using macOS API
+        for (pid, _proc) in processes.iter() {
+            let pid_u32 = pid.as_u32();
+
+            // Try to get the responsible PID (macOS-specific)
+            if let Some(resp_pid) = macos::get_responsible_pid(pid_u32) {
+                if resp_pid != pid_u32 && processes.contains_key(&Pid::from_u32(resp_pid)) {
+                    responsible_map.insert(*pid, Pid::from_u32(resp_pid));
+                }
+            }
+        }
+
+        // Second pass: for processes without a responsible PID, try heuristics
+        // This helps group Safari's WebKit processes and other known app helpers
+        #[cfg(target_os = "macos")]
+        {
+            // Build a map of app names to their PIDs
+            let mut app_name_to_pid: HashMap<String, Pid> = HashMap::new();
+            for (pid, proc) in processes.iter() {
+                let name = proc.name().to_string_lossy().to_string();
+                // Store the main app process (not helpers)
+                if macos::get_parent_app_name(&name).is_none() {
+                    app_name_to_pid.insert(name.to_lowercase(), *pid);
+                }
+            }
+
+            // Map helper processes to their parent apps
+            for (pid, proc) in processes.iter() {
+                if responsible_map.contains_key(pid) {
+                    continue;
+                }
+                let name = proc.name().to_string_lossy().to_string();
+                if let Some(parent_app) = macos::get_parent_app_name(&name) {
+                    // Find the parent app's PID
+                    let parent_lower = parent_app.to_lowercase();
+                    if let Some(&parent_pid) = app_name_to_pid.get(&parent_lower) {
+                        if parent_pid != *pid {
+                            responsible_map.insert(*pid, parent_pid);
+                        }
+                    }
+                }
+            }
+
+            // Also try process group for remaining processes
+            let mut pgid_to_leader: HashMap<u32, Pid> = HashMap::new();
+
+            // Find process group leaders (processes where PID == PGID)
+            for (pid, _proc) in processes.iter() {
+                if responsible_map.contains_key(pid) {
+                    continue;
+                }
+                if let Some(pgid) = macos::get_process_group(pid.as_u32()) {
+                    if pgid == pid.as_u32() {
+                        pgid_to_leader.insert(pgid, *pid);
+                    }
+                }
+            }
+
+            // Map non-leader processes to their group leader
+            for (pid, _proc) in processes.iter() {
+                if responsible_map.contains_key(pid) {
+                    continue;
+                }
+                if let Some(pgid) = macos::get_process_group(pid.as_u32()) {
+                    if pgid != pid.as_u32() {
+                        if let Some(&leader) = pgid_to_leader.get(&pgid) {
+                            if processes.contains_key(&leader) {
+                                responsible_map.insert(*pid, leader);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Group processes by responsible PID
         let mut children_map: HashMap<Pid, Vec<Pid>> = HashMap::new();
+        let mut root_pids: Vec<Pid> = Vec::new();
 
         for (pid, proc) in processes.iter() {
-            let parent_pid = proc.parent();
+            // Check if this process has a responsible parent
+            if let Some(&resp_pid) = responsible_map.get(pid) {
+                children_map.entry(resp_pid).or_default().push(*pid);
+            } else {
+                // Fall back to parent PID logic
+                let parent_pid = proc.parent();
 
-            if let Some(ppid) = parent_pid {
-                if processes.contains_key(&ppid) && ppid.as_u32() > 1 {
-                    children_map.entry(ppid).or_default().push(*pid);
+                if let Some(ppid) = parent_pid {
+                    // Check if parent has a different responsible process
+                    // If so, this process is actually a root
+                    let parent_resp = responsible_map.get(&ppid).copied();
+                    let my_resp = responsible_map.get(pid).copied();
+
+                    if parent_resp == my_resp && processes.contains_key(&ppid) && ppid.as_u32() > 1 {
+                        children_map.entry(ppid).or_default().push(*pid);
+                    } else {
+                        root_pids.push(*pid);
+                    }
                 } else {
                     root_pids.push(*pid);
                 }
-            } else {
-                root_pids.push(*pid);
             }
         }
 
@@ -134,7 +368,7 @@ impl App {
                     expanded: self.expanded_pids.contains(&root_pid),
                 };
 
-                // Recursively collect all children
+                // Collect all children (processes whose responsible PID is this root)
                 self.collect_children(&mut group, root_pid, &children_map, processes);
 
                 // Aggregate stats from children
